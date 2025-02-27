@@ -4,7 +4,7 @@
 struct Conv{T<:AbstractFloat} <: Layer
     K::Array{T,3}        # W x H x C_out
     b::Vector{T}         # one bias for each output channel
-    B::Array{T,4}        # 1 x final_size x (W_out*H_out*C_out)
+    B::Array{T,3}        # 1 x final_size x (W_out*H_out*C_out)
 
     x::Array{T,4}        # W x H x C_in x BatchSize
     d::Array{T,4}        # 1 x BatchSize
@@ -65,94 +65,57 @@ function Conv(kernel::Tuple{Int,Int}, channels::Pair{Int,Int}, σ::Function; pad
 end
 
 function (c::ConvConstructor)(rng::AbstractRNG, ::Type{T}, insz::Union{Int,Tuple{Vararg{Int}}}, finlsz::Int) where {T<:AbstractFloat}
-    if insz isa Tuple
-        # Standard convolution
-        c.kernel[1] <= insz[1] || throw(ArgumentError("Input width $(insz[1]) is smaller than kernel width $(c.kernel[1])"))
-        c.kernel[2] <= insz[2] || throw(ArgumentError("Input height $(insz[2]) is smaller than kernel height $(c.kernel[2])"))
-        insz[3] == c.channels[1] || throw(ArgumentError("Input channels $(insz[3]) doesn't match expected $(c.channels[1])"))
+    # TODO
+end
+
+
+
+
+struct PaddedView{T,N} <: AbstractArray{T,4}
+    img::Array{T,N}
+    i::Int          # Starting row in padded coordinates
+    j::Int          # Starting column in padded coordinates
+    padding::Int    # Padding size
+    dilation::Int   # Dilation factor
+    H::Int          # Original image height
+    W::Int          # Original image width
+    C::Int          # Number of channels
+    B::Int          # Batch size
+    kernel_height::Int
+    kernel_width::Int
+end
+
+# Define the size of each patch
+Base.size(pv::PaddedView) = (pv.kernel_height, pv.kernel_width, pv.C, pv.B)
+
+# Correctly index into the image based on patch position (m, n)
+function Base.getindex(pv::PaddedView{T,N}, m::Int, n::Int, c::Int, b::Int) where {T,N}
+    # Compute position in padded coordinates
+    row_padded = pv.i + (m - 1) * pv.dilation
+    col_padded = pv.j + (n - 1) * pv.dilation
+    # Check if the position is within the original image bounds
+    if (pv.padding + 1 <= row_padded <= pv.padding + pv.H) &&
+       (pv.padding + 1 <= col_padded <= pv.padding + pv.W)
+        row_orig = row_padded - pv.padding
+        col_orig = col_padded - pv.padding
+        return pv.img[row_orig, col_orig, c, b]
     else
-        # 1D convolution either treat input either horizontally or vertically depending on the kernel size either way it will come in as an AbstractVecOrMat
-        # so no difference in implementation
-        (min(c.kernel) == 1 && max(c.kernel) <= insz) || throw(ArgumentError("Input size $(insz) doesn't match kernel size $(c.kernel)"))
+        return zero(T)
     end
-    return Conv(), outsz
 end
 
-
-
-
-### Cross Correlation Primitives ###
-function calc_output_size(
-    input_size::Tuple{Int,Int}, kernel_size::Tuple{Int,Int},
-    padding::Int, stride::Int, dilation::Int
-)::Tuple{Int,Int}
-    H_in, W_in = input_size
-    K_h, K_w = kernel_size
-
-    effective_k_h = K_h + (K_h - 1) * (dilation - 1)
-    effective_k_w = K_w + (K_w - 1) * (dilation - 1)
-
-    H_out = div(H_in + 2 * padding - effective_k_h, stride) + 1
-    W_out = div(W_in + 2 * padding - effective_k_w, stride) + 1
-
-    return (H_out, W_out)
-end
-
-function allocate(
-    ::Type{T}, A::Array{T,4}, K::Array{T,2},
-    padding::Int, stride::Int, dilation::Int
-)::Array{T,4} where {T<:AbstractFloat}
-    H_in, W_in, C, N = size(A)
-    K_h, K_w = size(K)
-    H_out, W_out = calc_output_size((H_in, W_in), (K_h, K_w), padding, stride, dilation)
-    return zeros(T, H_out, W_out, 1, N)
-end
-
-# Helper function for kernel computation with SIMD
-@inline function compute_kernel(
-    A::Array{T,4}, K::SMatrix{KH,KW,T},
-    i::Int, j::Int, C::Int, n::Int,
-    H_in::Int, W_in::Int,
-    padding::Int, stride::Int, dilation::Int
-)::T where {T,KH,KW}
-    acc = zero(T)
-    start_h = i * stride - padding
-    start_w = j * stride - padding
-
-    @fastmath @inbounds for c in 1:C
-        @simd for ki in 1:KH
-            @simd for kj in 1:KW
-                in_h = start_h + (ki - 1) * dilation
-                in_w = start_w + (kj - 1) * dilation
-
-                if 1 <= in_h <= H_in && 1 <= in_w <= W_in
-                    acc += A[in_h, in_w, c, n] * K[ki, kj]
-                end
-            end
-        end
-    end
-    return acc
-end
-
-function crosscor!(
-    result::Array{T,4}, A::Array{T,4}, K::Array{T,2},
-    padding::Int, stride::Int, dilation::Int
-)::Nothing where {T<:AbstractFloat}
-    H_in, W_in, C, N = size(A)
-    K_h, K_w = size(K)
-    H_out, W_out = size(result)[1:2]
-
-    # Convert kernel to static array for better SIMD
-    static_K = SMatrix{K_h,K_w,T}(K)
-
-    # Parallelize all independent computations
-    @floop ThreadedEx() for idx in CartesianIndices((H_out, W_out, N))
-        i, j, n = Tuple(idx)
-
-        result[i, j, 1, n] = compute_kernel(
-            A, static_K, i, j, C, n,
-            H_in, W_in, padding, stride, dilation
-        ) + b
-    end
-    return nothing
+# The convolution iterator function
+function convolution_iterator(img, kernel_size::Tuple{Int,Int}, padding::Int,
+    dilation::Int, stride::Int)
+    kernel_height, kernel_width = kernel_size
+    H, W, C, B = size(img)
+    # Calculate the range of starting positions
+    i_max = H + 2 * padding - (kernel_height - 1) * dilation
+    j_max = W + 2 * padding - (kernel_width - 1) * dilation
+    i_range = 1:stride:max(1, i_max)
+    j_range = 1:stride:max(1, j_max)
+    # Return an iterator over PaddedView objects
+    return (PaddedView(img, i, j, padding, dilation, H, W, C, B,
+        kernel_height, kernel_width)
+            for i in i_range, j in j_range)
 end

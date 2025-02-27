@@ -31,8 +31,9 @@ end
 
 function feedback!(l::Dense{T}, e::AbstractArray{T}, η::T) where {T<:AbstractFloat}
     size(e, 1) == size(l.B, 2) || throw(DimensionMismatch("Error signal dimension doesn't match B matrix"))
-    ΔW = l.B * e .* l.cache[:d] * l.cache[:x]'
-    Δb = vec(sum(l.B * e .* l.cache[:d], dims=2))
+    Δ = l.B * e .* l.cache[:d]
+    ΔW = Δ * l.cache[:x]'
+    Δb = vec(sum(Δ, dims=2))
     l.W .-= η .* ΔW
     l.b .-= η .* Δb
 end
