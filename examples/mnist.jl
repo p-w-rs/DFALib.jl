@@ -1,6 +1,4 @@
-include("../src/DFALib.jl")
-using .DFALib
-
+using DFALib
 using MLDatasets, OneHotArrays, LinearAlgebra, Random, ProgressMeter, Plots
 
 batch_size = 1024
